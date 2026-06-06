@@ -276,21 +276,114 @@ def xml_attr_escape(s):
     )
 
 
+def _esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _nbsp_text_nodes(html_line):
+    """spaces -> &nbsp; in text nodes only (keeps spaces inside tags/attrs)."""
+    parts = re.split(r"(<[^>]+>)", html_line)
+    return "".join(p if p.startswith("<") else p.replace(" ", "&nbsp;") for p in parts)
+
+
+def _code_block_html(code, lang):
+    """fenced code -> mono grey block; pygments inline-styled spans if lang known."""
+    body = None
+    if lang:
+        try:
+            from pygments import highlight
+            from pygments.lexers import get_lexer_by_name
+            from pygments.formatters import HtmlFormatter
+
+            body = highlight(
+                code, get_lexer_by_name(lang), HtmlFormatter(noclasses=True, nowrap=True)
+            )
+        except Exception:
+            body = None
+    if body is None:
+        body = _esc(code)
+    lines = body.rstrip("\n").split("\n")
+    return (
+        '<div style="background-color:#F8F8F8;font-family:Courier New,monospace;'
+        'font-size:11px;padding:4px;text-align:left;">%s</div>'
+        % "".join("<div>%s</div>" % (_nbsp_text_nodes(ln) or "<br>") for ln in lines)
+    )
+
+
 def text_to_value(text):
-    """markdown-lite -> draw.io html value, attribute-escaped.
+    """markdown -> draw.io html value, attribute-escaped.
+
+    Supports **bold**, *italic*, `code`, ```lang fenced blocks (pygments
+    syntax colors), # / ## / ### headings, - and 1. lists; newline = line
+    break, blank line = paragraph.
 
     Two escape layers, matching draw.io's on-disk form (e.g. &amp;nbsp;):
     1. html layer: literal &,<,> in user text -> entities
     2. attr layer: the whole html (tags + entities) xml-escaped for value="..."
     """
-    h = text.strip().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    tokens = {}
+
+    def stash(html):  # protect pre-built html from escaping/markdown passes
+        key = "\x00%d\x00" % len(tokens)
+        tokens[key] = html
+        return key
+
+    t = text.strip()
+    t = re.sub(
+        r"```([\w+-]*)[ \t]*\n(.*?)\n?```",
+        lambda m: stash(_code_block_html(m.group(2), m.group(1))),
+        t,
+        flags=re.S,
+    )
+    t = re.sub(
+        r"`([^`\n]+)`",
+        lambda m: stash(
+            '<font face="Courier New" style="background-color:#F0F0F0;">%s</font>'
+            % _esc(m.group(1))
+        ),
+        t,
+    )
+    h = _esc(t)
     h = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", h)
     h = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", h)
-    paras = re.split(r"\n\s*\n", h)
-    out = "<div><br></div>".join(
-        "".join("<div>%s</div>" % ln for ln in p.split("\n")) for p in paras
-    )
-    return xml_attr_escape(out)
+
+    hsize = {1: 17, 2: 14, 3: 12}
+    out, list_tag = [], [None]
+
+    def close_list():
+        if list_tag[0]:
+            out.append("</%s>" % list_tag[0])
+            list_tag[0] = None
+
+    for ln in (l.rstrip() for l in h.split("\n")):
+        m_h = re.match(r"(#{1,3})\s+(.*)", ln)
+        m_li = re.match(r"-\s+(.*)", ln)
+        m_ol = re.match(r"\d+[.)]\s+(.*)", ln)
+        if m_h:
+            close_list()
+            out.append(
+                '<div style="font-size:%dpx;"><b>%s</b></div>'
+                % (hsize[len(m_h.group(1))], m_h.group(2))
+            )
+        elif m_li or m_ol:
+            tag = "ul" if m_li else "ol"
+            if list_tag[0] != tag:
+                close_list()
+                out.append('<%s style="margin:0;padding-left:18px;">' % tag)
+                list_tag[0] = tag
+            out.append("<li>%s</li>" % (m_li or m_ol).group(1))
+        elif not ln:
+            close_list()
+            out.append("<div><br></div>")
+        else:
+            close_list()
+            out.append("<div>%s</div>" % ln)
+    close_list()
+
+    res = "".join(out)
+    for key, html in tokens.items():
+        res = res.replace(key, html)
+    return xml_attr_escape(res)
 
 
 def est_height(text, width):

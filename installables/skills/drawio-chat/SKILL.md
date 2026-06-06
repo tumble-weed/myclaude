@@ -45,7 +45,16 @@ python3 <skill-dir>/drawio_helper.py FILE add-edge SRC_ID DST_ID [--label L] [--
 python3 <skill-dir>/drawio_helper.py FILE set-text ID < text                 # keeps style/geometry
 python3 <skill-dir>/drawio_helper.py FILE recolor ID yellow|blue|plain
 ```
-Text markup: **bold**, *italic*, newline = line break, blank line = paragraph.
+Text markup (add-note/add-box/set-text stdin is markdown; the helper converts it
+to draw.io HTML — never hand-write HTML in stdin):
+- `**bold**`, `*italic*`, newline = line break, blank line = paragraph
+- `#` / `##` / `###` headings; `- ` and `1. ` lists
+- `` `inline code` `` -> monospace with grey background
+- fenced code blocks -> syntax-highlighted via Pygments. ALWAYS tag the
+  language (```python, ```sql, ```js, ...) — that's what triggers coloring;
+  untagged fences render as plain monospace. Indentation is preserved.
+  Any Pygments lexer name works; unknown names fall back to plain mono.
+- code blocks render fixed-width: size the note (`--w`) to the longest line
 add-* prints the new cell id (use it for edges).
 
 Raw-XML fallback — ONLY when presets can't express what you need (clouds,
