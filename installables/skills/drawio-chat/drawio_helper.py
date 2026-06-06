@@ -5,11 +5,18 @@ Lets an agent read/write a .drawio file purely via Bash so the file never
 enters the harness's Read/Edit tracking (avoids full-file context injections).
 
 Usage:
-  drawio_helper.py FILE sdiff SNAPSHOT       # SEMANTIC diff snapshot -> live: one compact line
-                                             # per added/removed/changed cell, values decoded to
-                                             # plain text. PREFER this over raw diff for reading.
-  drawio_helper.py FILE diff SNAPSHOT        # raw unified diff (fallback, e.g. to debug XML)
-  drawio_helper.py FILE snapshot DIR         # cp to DIR/<name>.NNN.drawio, prints path
+Versioning — own index (private git repo per diagram under ~/.cache/drawio-chat/<name>-<pathhash>/,
+independent of any .git the diagram's directory may have; override root with $DRAWIO_VAULT):
+  drawio_helper.py FILE snapshot [-m MSG]    # commit current state to vault (no-op if unchanged)
+  drawio_helper.py FILE versions             # list versions: vN <rev> <date> <msg>
+  drawio_helper.py FILE restore REF          # write version back to FILE (auto-snapshots live first)
+  drawio_helper.py FILE import-dir DIR       # one-off: migrate legacy .NNN.drawio copies into vault
+REF = vN | git rev | HEAD~k. Legacy mode kept: `snapshot DIR` copies to DIR/<name>.NNN.drawio.
+
+  drawio_helper.py FILE sdiff [REF|PATH]     # SEMANTIC diff version -> live (default HEAD): one
+                                             # compact line per added/removed/changed cell, values
+                                             # decoded to plain text. PREFER this for reading.
+  drawio_helper.py FILE diff [REF|PATH]      # raw unified diff (fallback, e.g. to debug XML)
   drawio_helper.py FILE insert               # stdin: mxCell XML -> inserted before </root>
   drawio_helper.py FILE replace-cell ID      # stdin: full new <mxCell .../> XML for ID
   drawio_helper.py FILE delete-cell ID       # remove cell with ID
@@ -57,6 +64,80 @@ def write_atomic(path, text):
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, path)
+
+
+VAULT_ROOT = os.environ.get(
+    "DRAWIO_VAULT", os.path.expanduser("~/.cache/drawio-chat")
+)
+
+
+def vault_dir(path):
+    import hashlib
+
+    ap = os.path.abspath(path)
+    slug = "%s-%s" % (
+        os.path.splitext(os.path.basename(ap))[0],
+        hashlib.sha1(ap.encode()).hexdigest()[:8],
+    )
+    return os.path.join(VAULT_ROOT, slug)
+
+
+def git(vd, *a):
+    return subprocess.run(["git", "-C", vd] + list(a), text=True, capture_output=True)
+
+
+GIT_ID = ["-c", "user.name=drawio-helper", "-c", "user.email=drawio-helper@local"]
+
+
+def ensure_vault(path):
+    vd = vault_dir(path)
+    if not os.path.isdir(os.path.join(vd, ".git")):
+        os.makedirs(vd, exist_ok=True)
+        r = git(vd, "init", "-q")
+        if r.returncode != 0:
+            die("git init failed: %s" % r.stderr)
+    return vd
+
+
+def resolve_ref(vd, ref):
+    """vN -> git rev; anything else passes through."""
+    m = re.fullmatch(r"v(\d+)", ref)
+    if not m:
+        return ref
+    total = git(vd, "rev-list", "--count", "HEAD").stdout.strip()
+    if not total.isdigit() or int(m.group(1)) > int(total) or int(m.group(1)) < 1:
+        die("no such version %s (have v1..v%s)" % (ref, total or 0))
+    return "HEAD~%d" % (int(total) - int(m.group(1)))
+
+
+def vault_show(path, ref):
+    vd = vault_dir(path)
+    r = git(vd, "show", "%s:%s" % (resolve_ref(vd, ref), os.path.basename(path)))
+    if r.returncode != 0:
+        die("cannot read version %s: %s" % (ref, r.stderr.strip()))
+    return r.stdout
+
+
+def vault_commit(path, msg):
+    """Returns 'vN <rev>' or None if nothing changed."""
+    vd = ensure_vault(path)
+    name = os.path.basename(path)
+    write_atomic(os.path.join(vd, name), read(path))
+    git(vd, "add", name)
+    r = git(vd, *GIT_ID, "commit", "-q", "-m", msg)
+    if r.returncode != 0:
+        if "nothing to commit" in r.stdout + r.stderr:
+            return None
+        die("commit failed: %s%s" % (r.stdout, r.stderr))
+    n = git(vd, "rev-list", "--count", "HEAD").stdout.strip()
+    rev = git(vd, "rev-parse", "--short", "HEAD").stdout.strip()
+    return "v%s %s" % (n, rev)
+
+
+def old_content(path, args):
+    """For diff/sdiff: arg may be a legacy snapshot file path or a vault REF."""
+    ref = args[0] if args else "HEAD"
+    return read(ref) if os.path.exists(ref) else vault_show(path, ref)
 
 
 def cell_block_re(cell_id):
@@ -113,8 +194,8 @@ def value_to_text(v):
     t = re.sub(r"<br\s*/?>", "\n", t)
     t = re.sub(r"</?div[^>]*>\s*|</?p[^>]*>\s*", "\n", t)
     t = re.sub(r"<[^>]+>", "", t)
-    t = html_mod.unescape(t)  # html layer
-    return re.sub(r"\s*\n\s*", " / ", t).strip()
+    t = html_mod.unescape(t).strip()  # html layer
+    return re.sub(r"\s*\n\s*", " / ", t)
 
 
 def cell_kind(c):
@@ -263,31 +344,77 @@ def main():
     args = sys.argv[3:]
 
     if cmd == "diff":
-        if not args:
-            die("diff needs SNAPSHOT path")
-        r = subprocess.run(["diff", args[0], path], text=True)
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".drawio", delete=False) as tf:
+            tf.write(old_content(path, args))
+        r = subprocess.run(["diff", tf.name, path], text=True)
+        os.unlink(tf.name)
         sys.exit(0 if r.returncode in (0, 1) else r.returncode)
 
     if cmd == "sdiff":
-        if not args:
-            die("sdiff needs SNAPSHOT path")
-        sdiff(read(args[0]), read(path))
+        sdiff(old_content(path, args), read(path))
         return
 
     if cmd == "snapshot":
+        if args and not args[0].startswith("-"):  # legacy: snapshot DIR
+            d = args[0]
+            os.makedirs(d, exist_ok=True)
+            base = os.path.splitext(os.path.basename(path))[0]
+            ns = [
+                int(m.group(1))
+                for f in os.listdir(d)
+                if (m := re.fullmatch(re.escape(base) + r"\.(\d{3})\.drawio", f))
+            ]
+            dest = os.path.join(d, "%s.%03d.drawio" % (base, max(ns, default=-1) + 1))
+            write_atomic(dest, read(path))
+            print(dest)
+            return
+        msg = args[args.index("-m") + 1] if "-m" in args else "snapshot"
+        print(vault_commit(path, msg) or "no changes since last snapshot")
+        return
+
+    if cmd == "versions":
+        vd = vault_dir(path)
+        log = git(vd, "log", "--format=%h\t%ad\t%s", "--date=format:%m-%d %H:%M")
+        if log.returncode != 0:
+            die("no vault yet for %s (run snapshot first)" % path)
+        entries = log.stdout.strip().split("\n")
+        total = len(entries)
+        for i, e in enumerate(entries):
+            print("v%d\t%s" % (total - i, e))
+        print("vault: %s" % vd)
+        return
+
+    if cmd == "restore":
         if not args:
-            die("snapshot needs DIR")
-        d = args[0]
-        os.makedirs(d, exist_ok=True)
+            die("restore needs REF (vN | rev | HEAD~k)")
+        content = vault_show(path, args[0])
+        pre = vault_commit(path, "pre-restore auto-snapshot")
+        write_atomic(path, content)
+        print("restored %s -> %s%s" % (args[0], path,
+              " (live state saved as %s)" % pre if pre else ""))
+        return
+
+    if cmd == "import-dir":
+        if not args:
+            die("import-dir needs DIR of legacy .NNN.drawio copies")
         base = os.path.splitext(os.path.basename(path))[0]
-        ns = [
-            int(m.group(1))
-            for f in os.listdir(d)
-            if (m := re.fullmatch(re.escape(base) + r"\.(\d{3})\.drawio", f))
-        ]
-        dest = os.path.join(d, "%s.%03d.drawio" % (base, max(ns, default=-1) + 1))
-        write_atomic(dest, read(path))
-        print(dest)
+        files = sorted(
+            f for f in os.listdir(args[0])
+            if re.fullmatch(re.escape(base) + r"\.\d{3}\.drawio", f)
+        )
+        if not files:
+            die("no %s.NNN.drawio files in %s" % (base, args[0]))
+        vd = ensure_vault(path)
+        name = os.path.basename(path)
+        n = 0
+        for f in files:
+            write_atomic(os.path.join(vd, name), read(os.path.join(args[0], f)))
+            git(vd, "add", name)
+            if git(vd, *GIT_ID, "commit", "-q", "-m", "import %s" % f).returncode == 0:
+                n += 1
+        print("imported %d/%d (skipped no-change duplicates), vault: %s" % (n, len(files), vd))
         return
 
     text = read(path)

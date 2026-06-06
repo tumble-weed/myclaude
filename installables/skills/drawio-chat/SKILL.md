@@ -17,15 +17,23 @@ Alternately, the user might assimilate your changes with his own modifications.
 
 ALL access to the .drawio file MUST go through `drawio_helper.py` (in this skill's base directory) via Bash. NEVER use the Read/Edit/Write tools on the .drawio file — once the harness tracks it, it re-injects the full file into context on every user save, which is the dominant token cost.
 
+Versioning — backups live in a private per-diagram git vault under
+`~/.cache/drawio-chat/<name>-<pathhash>/` (independent of the project's own .git;
+survives reboots; delta-compressed). REF = `vN` | git rev | `HEAD~k`.
+```
+python3 <skill-dir>/drawio_helper.py FILE snapshot [-m MSG]  # commit to vault (no-op if unchanged)
+python3 <skill-dir>/drawio_helper.py FILE versions           # list vN, rev, date, message
+python3 <skill-dir>/drawio_helper.py FILE restore REF        # roll FILE back (auto-saves live first)
+```
+
 Reading — PREFER `sdiff` (one compact line per added/removed/changed cell, text
 decoded to plain language). It auto-falls-back to full old/new XML per cell it
 cannot classify. For unexpected/major changes, drill in with `get-cell` or raw `diff`:
 ```
-python3 <skill-dir>/drawio_helper.py FILE sdiff SNAPSHOT     # semantic diff (default read)
-python3 <skill-dir>/drawio_helper.py FILE snapshot DIR       # auto-numbered backup (prints path)
+python3 <skill-dir>/drawio_helper.py FILE sdiff [REF]        # semantic diff vs vault (default HEAD)
 python3 <skill-dir>/drawio_helper.py FILE get-cell ID        # full XML of one cell
 python3 <skill-dir>/drawio_helper.py FILE list-cells [PAT]   # id + text snippet; e.g. PAT shape=cloud
-python3 <skill-dir>/drawio_helper.py FILE diff SNAPSHOT      # raw unified diff (last resort)
+python3 <skill-dir>/drawio_helper.py FILE diff [REF]         # raw unified diff (last resort)
 ```
 
 Writing — PREFER the scaffolded commands (you emit only text + coords; the script
@@ -48,9 +56,9 @@ python3 <skill-dir>/drawio_helper.py FILE replace-cell ID    # stdin: replacemen
 python3 <skill-dir>/drawio_helper.py FILE delete-cell ID
 ```
 
-Workflow per exchange (use a session dir like /tmp/drawio-chat-<project>/ for snapshots):
+Workflow per exchange:
 
-1. session start: `snapshot`, then `list-cells shape=cloud` to find the user's messages (one initial full read via Bash `cat` is OK if needed for layout)
-2. user turn: `diff` latest snapshot vs live to read only their changes, then `snapshot`
-3. your turn: answer via `insert`/`replace-cell` (yellow elements), then `snapshot`
+1. session start: `snapshot -m "session start"`, then `list-cells shape=cloud` to find the user's messages (one initial full read via Bash `cat` is OK if needed for layout)
+2. user turn: `sdiff` (defaults to vs last snapshot) to read only their changes, then `snapshot -m "<what they added>"`
+3. your turn: answer via `add-note`/`add-edge` (yellow), then `snapshot -m "answered <topic>"`
 
