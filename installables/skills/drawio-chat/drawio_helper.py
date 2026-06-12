@@ -7,11 +7,20 @@ enters the harness's Read/Edit tracking (avoids full-file context injections).
 Usage:
 Versioning — own index (private git repo per diagram under ~/.cache/drawio-chat/<name>-<pathhash>/,
 independent of any .git the diagram's directory may have; override root with $DRAWIO_VAULT):
-  drawio_helper.py FILE snapshot [-m MSG]    # commit current state to vault (no-op if unchanged)
+  drawio_helper.py FILE snapshot [-m MSG]    # commit current state to vault (no-op if unchanged);
+                                             # also commits <name>.code.md (mother spec) if present
   drawio_helper.py FILE versions             # list versions: vN <rev> <date> <msg>
   drawio_helper.py FILE restore REF          # write version back to FILE (auto-snapshots live first)
   drawio_helper.py FILE import-dir DIR       # one-off: migrate legacy .NNN.drawio copies into vault
+  drawio_helper.py FILE sync-status          # clean | diag-newer | md-newer | both-changed
+  drawio_helper.py FILE code-md-path         # print path of <name>.code.md (the durable mother spec)
 REF = vN | git rev | HEAD~k. Legacy mode kept: `snapshot DIR` copies to DIR/<name>.NNN.drawio.
+
+Pages — multi-page .drawio files have one <diagram> per page. `--page N` (index, default
+0) or `--page name=Foo` targets a page on every write/inspect command; `--page all` widens
+list-cells/get-cell to the whole file. Legacy single-page files keep working with no --page.
+  drawio_helper.py FILE pages                # list  idx <TAB> name <TAB> id <TAB> cell-count
+  drawio_helper.py FILE add-page NAME        # append a new empty page; prints its index
 
   drawio_helper.py FILE sdiff [REF|PATH]     # SEMANTIC diff version -> live (default HEAD): one
                                              # compact line per added/removed/changed cell, values
@@ -119,11 +128,17 @@ def vault_show(path, ref):
 
 
 def vault_commit(path, msg):
-    """Returns 'vN <rev>' or None if nothing changed."""
+    """Returns 'vN <rev>' or None if nothing changed.
+
+    Commits the live .drawio and, if present, the mother spec <name>.code.md
+    as ONE joint version so the diagram and its spec stay in lockstep."""
     vd = ensure_vault(path)
     name = os.path.basename(path)
     write_atomic(os.path.join(vd, name), read(path))
     git(vd, "add", name)
+    mdp = code_md_path(path)
+    if os.path.exists(mdp):
+        git(vd, "add", os.path.basename(mdp))
     r = git(vd, *GIT_ID, "commit", "-q", "-m", msg)
     if r.returncode != 0:
         if "nothing to commit" in r.stdout + r.stderr:
@@ -138,6 +153,123 @@ def old_content(path, args):
     """For diff/sdiff: arg may be a legacy snapshot file path or a vault REF."""
     ref = args[0] if args else "HEAD"
     return read(ref) if os.path.exists(ref) else vault_show(path, ref)
+
+
+# ---- multi-page support -------------------------------------------------
+# A draw.io file holds one <diagram name=.. id=..><mxGraphModel><root>..</root>
+# </mxGraphModel></diagram> per page. We operate within a single page's body.
+# Legacy files with no <diagram> wrapper are treated as a single page 0.
+
+
+def split_diagrams(text):
+    """Ordered list of page dicts. Empty if the file has no <diagram> wrapper."""
+    res = []
+    for m in re.finditer(r"<diagram\b([^>]*)>(.*?)</diagram>", text, re.DOTALL):
+        attrs = m.group(1)
+        nm = re.search(r'name="([^"]*)"', attrs)
+        did = re.search(r'id="([^"]*)"', attrs)
+        res.append({
+            "name": nm.group(1) if nm else "",
+            "id": did.group(1) if did else "",
+            "inner": m.group(2),
+            "start": m.start(2),
+            "end": m.end(2),
+        })
+    return res
+
+
+def resolve_page_index(diags, page):
+    """page: int-like string, or 'name=Foo'. Returns 0-based index."""
+    if isinstance(page, str) and page.startswith("name="):
+        nm = page[5:]
+        for i, d in enumerate(diags):
+            if d["name"] == nm:
+                return i
+        die("no page named %r (have: %s)" % (nm, ", ".join(d["name"] for d in diags)))
+    try:
+        idx = int(page)
+    except (TypeError, ValueError):
+        die("bad --page %r (use an index or name=Foo)" % page)
+    if idx < 0 or idx >= len(diags):
+        die("page index %d out of range (have 0..%d)" % (idx, len(diags) - 1))
+    return idx
+
+
+def page_span(text, page):
+    """Return (body_text, abs_start, abs_end) for the chosen page.
+
+    page='all' (or a legacy file with no pages) -> whole text.
+    Legacy file + a specific non-zero page -> error."""
+    diags = split_diagrams(text)
+    if page == "all":
+        return text, 0, len(text)
+    if not diags:
+        if page not in (None, "0", 0):
+            die("file has no pages (legacy single-page); only page 0 is valid")
+        return text, 0, len(text)
+    idx = resolve_page_index(diags, page if page is not None else "0")
+    d = diags[idx]
+    return d["inner"], d["start"], d["end"]
+
+
+def pop_page(args):
+    """Strip a `--page VALUE` flag from positional args. Returns (value|None, rest)."""
+    page, out, i = None, [], 0
+    while i < len(args):
+        if args[i] == "--page" and i + 1 < len(args):
+            page, i = args[i + 1], i + 2
+        else:
+            out.append(args[i])
+            i += 1
+    return page, out
+
+
+def new_diagram_id():
+    import uuid
+
+    return uuid.uuid4().hex[:20]
+
+
+# ---- joint md + diagram versioning --------------------------------------
+
+
+def code_md_path(path):
+    """The mother spec lives in the vault, versioned alongside the .drawio."""
+    base = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(vault_dir(path), base + ".code.md")
+
+
+def sync_status(path):
+    """clean | diag-newer | md-newer | both-changed (or a no-vault note)."""
+    vd = vault_dir(path)
+    if not os.path.isdir(os.path.join(vd, ".git")):
+        print("no-vault (run snapshot first)")
+        return
+    if git(vd, "rev-parse", "--verify", "HEAD").returncode != 0:
+        print("no-snapshots (run snapshot first)")
+        return
+    name = os.path.basename(path)
+    committed_diag = git(vd, "show", "HEAD:%s" % name)
+    diag_dirty = committed_diag.returncode != 0 or read(path) != committed_diag.stdout
+
+    mdp = code_md_path(path)
+    committed_md = git(vd, "show", "HEAD:%s" % os.path.basename(mdp))
+    has_committed_md = committed_md.returncode == 0
+    working_md_exists = os.path.exists(mdp)
+    if not has_committed_md and not working_md_exists:
+        md_dirty = False
+    elif has_committed_md and working_md_exists:
+        md_dirty = read(mdp) != committed_md.stdout
+    else:
+        md_dirty = True  # exists on exactly one side
+
+    status = {
+        (False, False): "clean",
+        (True, False): "diag-newer",
+        (False, True): "md-newer",
+        (True, True): "both-changed",
+    }[(diag_dirty, md_dirty)]
+    print(status)
 
 
 def cell_block_re(cell_id):
@@ -157,34 +289,40 @@ def find_cell(text, cell_id):
 
 
 def parse_cells(text):
-    """id -> {value, style, edge, geo, raw} for every cell except roots 0/1."""
+    """id -> {value, style, edge, geo, raw, page} for every cell except roots 0/1.
+
+    `page` is the 0-based diagram index the cell lives in (0 for legacy files)."""
     cells = {}
-    for m in re.finditer(
-        r'[ \t]*<mxCell id="([^"]+)"([^>]*?)(?:/>|>(.*?)</mxCell>)', text, re.DOTALL
-    ):
-        cid, attrs, inner = m.group(1), m.group(2), m.group(3) or ""
-        if cid in ("0", "1"):
-            continue
-        v = re.search(r'value="([^"]*)"', attrs)
-        s = re.search(r'style="([^"]*)"', attrs)
-        geo = {}
-        g = re.search(r"<mxGeometry([^>]*)", inner)
-        if g:
-            for k in ("x", "y", "width", "height"):
-                gm = re.search(r'%s="([^"]+)"' % k, g.group(1))
-                if gm:
-                    geo[k] = gm.group(1)
-        cells[cid] = {
-            "value": v.group(1) if v else "",
-            "style": s.group(1) if s else "",
-            "edge": 'edge="1"' in attrs,
-            "ends": "->".join(
-            (re.search(r'%s="([^"]*)"' % k, attrs) or [None, "?"])[1]
-            for k in ("source", "target")
-        ),
-            "geo": geo,
-            "raw": m.group(0).strip("\n"),
-        }
+    diags = split_diagrams(text)
+    regions = [(i, d["inner"]) for i, d in enumerate(diags)] or [(0, text)]
+    for pidx, body in regions:
+        for m in re.finditer(
+            r'[ \t]*<mxCell id="([^"]+)"([^>]*?)(?:/>|>(.*?)</mxCell>)', body, re.DOTALL
+        ):
+            cid, attrs, inner = m.group(1), m.group(2), m.group(3) or ""
+            if cid in ("0", "1"):
+                continue
+            v = re.search(r'value="([^"]*)"', attrs)
+            s = re.search(r'style="([^"]*)"', attrs)
+            geo = {}
+            g = re.search(r"<mxGeometry([^>]*)", inner)
+            if g:
+                for k in ("x", "y", "width", "height"):
+                    gm = re.search(r'%s="([^"]+)"' % k, g.group(1))
+                    if gm:
+                        geo[k] = gm.group(1)
+            cells[cid] = {
+                "value": v.group(1) if v else "",
+                "style": s.group(1) if s else "",
+                "edge": 'edge="1"' in attrs,
+                "ends": "->".join(
+                    (re.search(r'%s="([^"]*)"' % k, attrs) or [None, "?"])[1]
+                    for k in ("source", "target")
+                ),
+                "geo": geo,
+                "raw": m.group(0).strip("\n"),
+                "page": pidx,
+            }
     return cells
 
 
@@ -221,16 +359,20 @@ def geo_str(geo):
 
 def sdiff(old_text, new_text):
     old, new = parse_cells(old_text), parse_cells(new_text)
+    multipage = max(
+        [len(split_diagrams(old_text)), len(split_diagrams(new_text))]
+    ) > 1
+    tag = lambda c: ("[p%d] " % c["page"]) if multipage else ""
     lines = []
     for cid in new:
         if cid not in old:
             c = new[cid]
             where = c["ends"] if c["edge"] else geo_str(c["geo"])
-            lines.append("+ %s %s %s :: %s" % (cid, cell_kind(c), where, value_to_text(c["value"])))
+            lines.append("+ %s%s %s %s :: %s" % (tag(c), cid, cell_kind(c), where, value_to_text(c["value"])))
     for cid in old:
         if cid not in new:
             c = old[cid]
-            lines.append("- %s %s :: %.60s" % (cid, cell_kind(c), value_to_text(c["value"])))
+            lines.append("- %s%s %s :: %.60s" % (tag(c), cid, cell_kind(c), value_to_text(c["value"])))
     for cid, c in new.items():
         if cid not in old or old[cid]["raw"] == c["raw"]:
             continue
@@ -254,9 +396,9 @@ def sdiff(old_text, new_text):
             unexplained = True
         if unexplained:
             # detail fallback: this change is beyond the compact vocabulary
-            lines.append("~ %s UNCLASSIFIED, full old/new:\nOLD: %s\nNEW: %s" % (cid, o["raw"], c["raw"]))
+            lines.append("~ %s%s UNCLASSIFIED, full old/new:\nOLD: %s\nNEW: %s" % (tag(c), cid, o["raw"], c["raw"]))
         elif changes:
-            lines.append("~ %s %s" % (cid, " | ".join(changes)))
+            lines.append("~ %s%s %s" % (tag(c), cid, " | ".join(changes)))
     print("\n".join(lines) if lines else "no cell changes")
 
 
@@ -423,11 +565,24 @@ def vertex_xml(cell_id, value, style, x, y, w, h):
     )
 
 
-def insert_before_root(path, text, xml):
+def insert_before_root(path, text, xml, page="0"):
     marker = "      </root>"
-    if marker not in text:
-        die("no </root> marker found")
-    write_atomic(path, text.replace(marker, xml + "\n" + marker, 1))
+    body, s, e = page_span(text, page)
+    if marker not in body:
+        die("no </root> marker found on page %s" % page)
+    new_body = body.replace(marker, xml + "\n" + marker, 1)
+    write_atomic(path, text[:s] + new_body + text[e:])
+
+
+def edit_cell_in_page(path, text, page, cell_id, transform):
+    """Find cell_id within `page`, replace its block with transform(block).
+
+    transform returns the replacement text ('' deletes the cell)."""
+    body, s, e = page_span(text, page)
+    m = find_cell(body, cell_id)
+    new_block = transform(m.group(0))
+    new_body = body[: m.start()] + new_block + body[m.end() :]
+    write_atomic(path, text[:s] + new_body + text[e:])
 
 
 def main():
@@ -447,6 +602,15 @@ def main():
 
     if cmd == "sdiff":
         sdiff(old_content(path, args), read(path))
+        return
+
+    if cmd == "sync-status":
+        sync_status(path)
+        return
+
+    if cmd == "code-md-path":
+        # where the mother spec lives (track this one with Read/Write, it is durable)
+        print(code_md_path(path))
         return
 
     if cmd == "snapshot":
@@ -512,44 +676,82 @@ def main():
 
     text = read(path)
 
+    if cmd == "pages":
+        diags = split_diagrams(text)
+        cells = parse_cells(text)
+        if not diags:
+            print("0\t(legacy single-page)\t-\t%d cells" % len(cells))
+            return
+        counts = {i: 0 for i in range(len(diags))}
+        for c in cells.values():
+            counts[c["page"]] += 1
+        for i, d in enumerate(diags):
+            print("%d\t%s\t%s\t%d cells" % (i, d["name"] or "-", d["id"] or "-", counts[i]))
+        return
+
+    if cmd == "add-page":
+        if not args:
+            die("add-page needs NAME")
+        name = args[0]
+        if "</mxfile>" not in text:
+            die("no </mxfile> marker (cannot add a page to a bare-mxGraphModel file)")
+        new_idx = len(split_diagrams(text))
+        block = (
+            '  <diagram id="%s" name="%s">\n'
+            '    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" '
+            'tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" '
+            'pageWidth="850" pageHeight="1100" math="0" shadow="0">\n'
+            "      <root>\n"
+            '        <mxCell id="0" />\n'
+            '        <mxCell id="1" parent="0" />\n'
+            "      </root>\n"
+            "    </mxGraphModel>\n"
+            "  </diagram>\n" % (new_diagram_id(), xml_attr_escape(name))
+        )
+        write_atomic(path, text.replace("</mxfile>", block + "</mxfile>", 1))
+        print("added page %d: %s" % (new_idx, name))
+        return
+
     if cmd == "insert":
+        page, _ = pop_page(args)
         xml = sys.stdin.read().rstrip("\n")
         if "<mxCell" not in xml:
             die("stdin had no <mxCell")
-        marker = "      </root>"
-        if marker not in text:
-            die("no </root> marker found")
-        write_atomic(path, text.replace(marker, xml + "\n" + marker, 1))
+        insert_before_root(path, text, xml, page or "0")
         print("inserted %d cell(s)" % xml.count("<mxCell"))
         return
 
     if cmd == "replace-cell":
-        if not args:
+        page, rest = pop_page(args)
+        if not rest:
             die("replace-cell needs ID")
         xml = sys.stdin.read().rstrip("\n")
         if "<mxCell" not in xml:
             die("stdin had no <mxCell")
-        m = find_cell(text, args[0])
-        write_atomic(path, text[: m.start()] + xml + "\n" + text[m.end() :])
-        print("replaced %s" % args[0])
+        edit_cell_in_page(path, text, page or "0", rest[0], lambda _block: xml + "\n")
+        print("replaced %s" % rest[0])
         return
 
     if cmd == "delete-cell":
-        if not args:
+        page, rest = pop_page(args)
+        if not rest:
             die("delete-cell needs ID")
-        m = find_cell(text, args[0])
-        write_atomic(path, text[: m.start()] + text[m.end() :])
-        print("deleted %s" % args[0])
+        edit_cell_in_page(path, text, page or "0", rest[0], lambda _block: "")
+        print("deleted %s" % rest[0])
         return
 
     if cmd == "get-cell":
-        if not args:
+        page, rest = pop_page(args)
+        if not rest:
             die("get-cell needs ID")
-        print(find_cell(text, args[0]).group(0).rstrip("\n"))
+        # id is unique -> search all pages by default; --page just narrows
+        body, _, _ = page_span(text, page or "all")
+        print(find_cell(body, rest[0]).group(0).rstrip("\n"))
         return
 
     if cmd in ("add-note", "add-box"):
-        o = parse_flags(args, {"w": "240", "h": None, "color": "yellow", "id": None, "x": None, "y": None})
+        o = parse_flags(args, {"w": "240", "h": None, "color": "yellow", "id": None,
+                               "x": None, "y": None, "page": "0"})
         if o["x"] is None or o["y"] is None:
             die("%s needs --x and --y" % cmd)
         raw = sys.stdin.read()
@@ -560,18 +762,22 @@ def main():
         cid = o["id"] or auto_id(text)
         style = "rounded=%d;whiteSpace=wrap;html=1;align=left;fillColor=%s;strokeColor=%s;" % (
             1 if cmd == "add-note" else 0, fill, stroke)
-        insert_before_root(path, text, vertex_xml(cid, text_to_value(raw), style, o["x"], o["y"], o["w"], h))
+        insert_before_root(path, text,
+                           vertex_xml(cid, text_to_value(raw), style, o["x"], o["y"], o["w"], h),
+                           o["page"])
         print(cid)
         return
 
     if cmd == "add-edge":
-        if len(args) < 2:
+        page, rest = pop_page(args)
+        if len(rest) < 2:
             die("add-edge needs SRC DST")
-        src, dst = args[0], args[1]
-        o = parse_flags(args[2:], {"label": "", "color": "yellow", "id": None, "arrow": True})
+        src, dst = rest[0], rest[1]
+        o = parse_flags(rest[2:], {"label": "", "color": "yellow", "id": None, "arrow": True})
         _, stroke = COLORS.get(o["color"]) or die("unknown color: %s" % o["color"])
+        body, _, _ = page_span(text, page or "0")
         for c in (src, dst):
-            find_cell(text, c)
+            find_cell(body, c)  # both endpoints must live on the same page
         cid = o["id"] or auto_id(text)
         xml = (
             '        <mxCell id="%s" edge="1" parent="1" source="%s" target="%s" '
@@ -581,41 +787,49 @@ def main():
             % (cid, src, dst, "classic" if o["arrow"] else "none",
                1 if o["arrow"] else 0, stroke, text_to_value(o["label"]) if o["label"] else "")
         )
-        insert_before_root(path, text, xml)
+        insert_before_root(path, text, xml, page or "0")
         print(cid)
         return
 
     if cmd == "set-text":
-        if not args:
+        page, rest = pop_page(args)
+        if not rest:
             die("set-text needs ID")
         raw = sys.stdin.read()
-        m = find_cell(text, args[0])
-        block = m.group(0)
-        new_block, n = re.subn(r'value="[^"]*"', 'value="%s"' % text_to_value(raw), block, count=1)
-        if not n:
-            die("cell %s has no value attribute" % args[0])
-        write_atomic(path, text[: m.start()] + new_block + text[m.end() :])
-        print("set-text %s" % args[0])
+
+        def _retext(block):
+            new_block, n = re.subn(r'value="[^"]*"', 'value="%s"' % text_to_value(raw), block, count=1)
+            if not n:
+                die("cell %s has no value attribute" % rest[0])
+            return new_block
+
+        edit_cell_in_page(path, text, page or "0", rest[0], _retext)
+        print("set-text %s" % rest[0])
         return
 
     if cmd == "recolor":
-        if len(args) < 2:
+        page, rest = pop_page(args)
+        if len(rest) < 2:
             die("recolor needs ID COLOR")
-        fill, stroke = COLORS.get(args[1]) or die("unknown color: %s" % args[1])
-        m = find_cell(text, args[0])
-        block = m.group(0)
-        for attr, val in (("fillColor", fill), ("strokeColor", stroke)):
-            if "%s=" % attr in block:
-                block = re.sub(r"%s=[^;\"]*" % attr, "%s=%s" % (attr, val), block)
-            else:
-                block = block.replace('style="', 'style="%s=%s;' % (attr, val), 1)
-        write_atomic(path, text[: m.start()] + block + text[m.end() :])
-        print("recolored %s -> %s" % (args[0], args[1]))
+        fill, stroke = COLORS.get(rest[1]) or die("unknown color: %s" % rest[1])
+
+        def _recolor(block):
+            for attr, val in (("fillColor", fill), ("strokeColor", stroke)):
+                if "%s=" % attr in block:
+                    block = re.sub(r"%s=[^;\"]*" % attr, "%s=%s" % (attr, val), block)
+                else:
+                    block = block.replace('style="', 'style="%s=%s;' % (attr, val), 1)
+            return block
+
+        edit_cell_in_page(path, text, page or "0", rest[0], _recolor)
+        print("recolored %s -> %s" % (rest[0], rest[1]))
         return
 
     if cmd == "list-cells":
-        pat = args[0] if args else ""
-        for m in re.finditer(r"<mxCell id=\"([^\"]+)\"([^>]*)>?", text):
+        page, rest = pop_page(args)
+        pat = rest[0] if rest else ""
+        body, _, _ = page_span(text, page or "0")
+        for m in re.finditer(r"<mxCell id=\"([^\"]+)\"([^>]*)>?", body):
             cell_id, attrs = m.group(1), m.group(2)
             if pat and pat not in attrs:
                 continue

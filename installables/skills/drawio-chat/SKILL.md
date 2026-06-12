@@ -13,6 +13,20 @@ The user might acknowledge your changes/messages while leaving them on the diagr
 
 Alternately, the user might assimilate your changes with his own modifications.
 
+## Modes (load on demand)
+
+- **Code representation** — when the chat turns to code changes (which files/classes/funcs a
+  change touches and how they relate), read `references/code-representation.md` and follow it.
+  It adds a durable `<name>.code.md` "mother" spec, a file-identity color grammar, and a
+  diagram⇄spec sync loop. Note: code-view overrides the blanket "Claude = yellow" rule —
+  code cells use no yellow/blue (those stay reserved for the chat layer); the reference has
+  the details.
+- **Planning** — when a chat is meant to become an implementation plan, read
+  `references/planning.md` and follow it. Explore on page 1, concretize code on a new page
+  (per code-representation.md), then dump a comprehensive, stand-alone plan md into
+  `.claude/todo/`. Plan md and the `<name>.code.md` spec are separate artifacts; the link
+  between chat and plan is mutual.
+
 ## File access — token discipline
 
 ALL access to the .drawio file MUST go through `drawio_helper.py` (in this skill's base directory) via Bash. NEVER use the Read/Edit/Write tools on the .drawio file — once the harness tracks it, it re-injects the full file into context on every user save, which is the dominant token cost.
@@ -24,6 +38,8 @@ survives reboots; delta-compressed). REF = `vN` | git rev | `HEAD~k`.
 python3 <skill-dir>/drawio_helper.py FILE snapshot [-m MSG]  # commit to vault (no-op if unchanged)
 python3 <skill-dir>/drawio_helper.py FILE versions           # list vN, rev, date, message
 python3 <skill-dir>/drawio_helper.py FILE restore REF        # roll FILE back (auto-saves live first)
+python3 <skill-dir>/drawio_helper.py FILE sync-status        # clean|diag-newer|md-newer|both-changed (code mode)
+python3 <skill-dir>/drawio_helper.py FILE code-md-path       # path of <name>.code.md mother spec (code mode)
 ```
 
 Reading — PREFER `sdiff` (one compact line per added/removed/changed cell, text
@@ -44,6 +60,13 @@ python3 <skill-dir>/drawio_helper.py FILE add-box  ...same flags... < text   # s
 python3 <skill-dir>/drawio_helper.py FILE add-edge SRC_ID DST_ID [--label L] [--no-arrow]
 python3 <skill-dir>/drawio_helper.py FILE set-text ID < text                 # keeps style/geometry
 python3 <skill-dir>/drawio_helper.py FILE recolor ID yellow|blue|plain
+```
+Multi-page: files can hold several pages (one `<diagram>` each). Every write/inspect command
+takes `--page N` (index, default 0) or `--page name=Foo`; `list-cells`/`get-cell` also accept
+`--page all`. Single-page diagrams keep working with no `--page`.
+```
+python3 <skill-dir>/drawio_helper.py FILE pages              # idx, name, id, cell-count
+python3 <skill-dir>/drawio_helper.py FILE add-page NAME      # append a page; prints its index
 ```
 Text markup (add-note/add-box/set-text stdin is markdown; the helper converts it
 to draw.io HTML — never hand-write HTML in stdin):
