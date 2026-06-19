@@ -55,8 +55,13 @@ def describe_existing(target: Path) -> str:
     return "existing entry"
 
 
-def cmd_install(claude_dir: Path, allow_partial: bool) -> int:
+def _tag(dry_run: bool) -> str:
+    return "[dry-run] " if dry_run else ""
+
+
+def cmd_install(claude_dir: Path, allow_partial: bool, dry_run: bool) -> int:
     items = discover_items()
+    tag = _tag(dry_run)
 
     plan: List[Tuple[Path, Path]] = []
     noops: List[Tuple[Path, Path]] = []
@@ -72,7 +77,7 @@ def cmd_install(claude_dir: Path, allow_partial: bool) -> int:
             plan.append((target, source))
 
     if clashes and not allow_partial:
-        print("ERROR: clashes detected — aborting install.")
+        print(f"{tag}ERROR: clashes detected — aborting install.")
         print("Re-run with --allow-partial-install to skip these slots.\n")
         for target, source, kind in clashes:
             print(f"  CLASH: {target}")
@@ -81,28 +86,30 @@ def cmd_install(claude_dir: Path, allow_partial: bool) -> int:
         return 1
 
     if clashes:
-        print("Skipping clashes (--allow-partial-install):")
+        print(f"{tag}Skipping clashes (--allow-partial-install):")
         for target, _source, kind in clashes:
             print(f"  SKIP: {target} ({kind})")
         print()
 
     for target, source in noops:
-        print(f"NOOP: {target} -> {source} (already linked)")
+        print(f"{tag}NOOP: {target} -> {source} (already linked)")
 
     for target, source in plan:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(source, target)
-        print(f"LINK: {target} -> {source}")
+        if not dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(source, target)
+        print(f"{tag}LINK: {target} -> {source}")
 
     print(
-        f"\nDone. linked={len(plan)} already_linked={len(noops)} "
+        f"\n{tag}Done. linked={len(plan)} already_linked={len(noops)} "
         f"clashes={len(clashes)}"
     )
     return 0
 
 
-def cmd_uninstall(claude_dir: Path) -> int:
+def cmd_uninstall(claude_dir: Path, dry_run: bool) -> int:
     items = discover_items()
+    tag = _tag(dry_run)
     removed = 0
     skipped_foreign = 0
     skipped_real = 0
@@ -111,30 +118,32 @@ def cmd_uninstall(claude_dir: Path) -> int:
     for category, name, source in items:
         target = target_for(claude_dir, category, name)
         if is_our_symlink(target, source):
-            target.unlink()
-            print(f"UNLINK: {target}")
+            if not dry_run:
+                target.unlink()
+            print(f"{tag}UNLINK: {target}")
             removed += 1
             continue
         if target.is_symlink():
-            print(f"SKIP: {target} (foreign symlink -> {os.readlink(target)})")
+            print(f"{tag}SKIP: {target} (foreign symlink -> {os.readlink(target)})")
             skipped_foreign += 1
             continue
         if target.exists():
-            print(f"SKIP: {target} ({describe_existing(target)}, not ours)")
+            print(f"{tag}SKIP: {target} ({describe_existing(target)}, not ours)")
             skipped_real += 1
             continue
-        print(f"NOOP: {target} (not present)")
+        print(f"{tag}NOOP: {target} (not present)")
         not_present += 1
 
     print(
-        f"\nDone. removed={removed} not_present={not_present} "
+        f"\n{tag}Done. removed={removed} not_present={not_present} "
         f"skipped_foreign_symlink={skipped_foreign} skipped_real={skipped_real}"
     )
     return 0
 
 
-def cmd_reinstall(claude_dir: Path) -> int:
+def cmd_reinstall(claude_dir: Path, dry_run: bool) -> int:
     items = discover_items()
+    tag = _tag(dry_run)
     created = 0
     already = 0
     skipped = 0
@@ -142,20 +151,21 @@ def cmd_reinstall(claude_dir: Path) -> int:
     for category, name, source in items:
         target = target_for(claude_dir, category, name)
         if is_our_symlink(target, source):
-            print(f"NOOP: {target} -> {source} (already linked)")
+            print(f"{tag}NOOP: {target} -> {source} (already linked)")
             already += 1
             continue
         if target.is_symlink() or target.exists():
-            print(f"SKIP: {target} ({describe_existing(target)})")
+            print(f"{tag}SKIP: {target} ({describe_existing(target)})")
             skipped += 1
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(source, target)
-        print(f"LINK: {target} -> {source}")
+        if not dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(source, target)
+        print(f"{tag}LINK: {target} -> {source}")
         created += 1
 
     print(
-        f"\nDone. created={created} already_linked={already} skipped={skipped}"
+        f"\n{tag}Done. created={created} already_linked={already} skipped={skipped}"
     )
     return 0
 
@@ -168,6 +178,11 @@ def main() -> int:
         "--claude-dir",
         default=str(Path.home() / ".claude"),
         help="Target Claude config dir (default: ~/.claude).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would happen without touching the filesystem.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -188,11 +203,11 @@ def main() -> int:
     claude_dir = Path(args.claude_dir).expanduser().resolve()
 
     if args.cmd == "install":
-        return cmd_install(claude_dir, args.allow_partial_install)
+        return cmd_install(claude_dir, args.allow_partial_install, args.dry_run)
     if args.cmd == "uninstall":
-        return cmd_uninstall(claude_dir)
+        return cmd_uninstall(claude_dir, args.dry_run)
     if args.cmd == "reinstall":
-        return cmd_reinstall(claude_dir)
+        return cmd_reinstall(claude_dir, args.dry_run)
     parser.error(f"unknown command: {args.cmd}")
     return 2
 

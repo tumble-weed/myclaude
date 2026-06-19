@@ -5,6 +5,9 @@ Lets an agent read/write a .drawio file purely via Bash so the file never
 enters the harness's Read/Edit tracking (avoids full-file context injections).
 
 Usage:
+Creating — start a blank diagram (seeds the vault as v1; refuses to clobber unless --force):
+  drawio_helper.py FILE new [--name PAGE] [--force]   # write an empty single-page .drawio
+
 Versioning — own index (private git repo per diagram under ~/.cache/drawio-chat/<name>-<pathhash>/,
 independent of any .git the diagram's directory may have; override root with $DRAWIO_VAULT):
   drawio_helper.py FILE snapshot [-m MSG]    # commit current state to vault (no-op if unchanged);
@@ -43,7 +46,8 @@ when presets can't express what you need.
   drawio_helper.py FILE add-edge SRC DST [--label L] [--color yellow] [--no-arrow]
   drawio_helper.py FILE set-text ID          # stdin: new text (same markup); keeps style/geometry
   drawio_helper.py FILE recolor ID COLOR     # restyle fill/stroke of an existing cell
-Colors: yellow (agent, default) | blue (acked) | plain.
+Colors: preset (yellow=agent default | blue=acked | plain) | hex '#FFF2CC'
+        (stroke auto-darkened) | explicit 'fill/stroke' pair (each a hex or preset).
 
 Notes:
 - Operates on raw text, not an XML parser, to preserve formatting exactly.
@@ -230,6 +234,24 @@ def new_diagram_id():
     return uuid.uuid4().hex[:20]
 
 
+def blank_drawio(page_name="Page-1"):
+    """A minimal, valid single-page .drawio file (empty canvas)."""
+    return (
+        '<mxfile host="drawio-helper">\n'
+        '  <diagram id="%s" name="%s">\n'
+        '    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" '
+        'tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" '
+        'pageWidth="850" pageHeight="1100" math="0" shadow="0">\n'
+        "      <root>\n"
+        '        <mxCell id="0" />\n'
+        '        <mxCell id="1" parent="0" />\n'
+        "      </root>\n"
+        "    </mxGraphModel>\n"
+        "  </diagram>\n"
+        "</mxfile>\n" % (new_diagram_id(), xml_attr_escape(page_name))
+    )
+
+
 # ---- joint md + diagram versioning --------------------------------------
 
 
@@ -407,6 +429,48 @@ COLORS = {  # (fill, stroke)
     "blue": ("#DAE8FC", "#6C8EBF"),
     "plain": ("#FFFFFF", "#000000"),
 }
+
+_HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def _norm_hex(h):
+    """#abc -> #aabbcc, validate, uppercase. None if not a hex literal."""
+    if not _HEX_RE.match(h):
+        return None
+    if len(h) == 4:
+        h = "#" + "".join(c * 2 for c in h[1:])
+    return h.upper()
+
+
+def _darken(hex6, factor=0.7):
+    """Derive a stroke color by darkening a fill hex."""
+    r, g, b = (int(hex6[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02X%02X%02X" % tuple(int(c * factor) for c in (r, g, b))
+
+
+def resolve_color(token):
+    """Map a color token -> (fill, stroke). Accepts:
+      preset name (yellow/blue/plain),
+      single hex '#FFF2CC' (stroke auto-darkened),
+      explicit pair 'fill/stroke' where each side is a hex or preset.
+    Returns None on anything unrecognized (callers die())."""
+    if token in COLORS:
+        return COLORS[token]
+    if "/" in token:
+        fpart, spart = token.split("/", 1)
+
+        def _side(s):
+            if s in COLORS:
+                return COLORS[s][0]
+            return _norm_hex(s)
+        fill, stroke = _side(fpart), _side(spart)
+        if fill is None or stroke is None:
+            return None
+        return (fill, stroke)
+    h = _norm_hex(token)
+    if h is None:
+        return None
+    return (h, _darken(h))
 
 
 def xml_attr_escape(s):
@@ -591,6 +655,20 @@ def main():
     path, cmd = sys.argv[1], sys.argv[2]
     args = sys.argv[3:]
 
+    if cmd == "new":
+        force = "--force" in args
+        o = parse_flags([a for a in args if a != "--force"], {"name": "Page-1"})
+        if os.path.exists(path) and not force:
+            die("refusing to overwrite existing %s (pass --force to clobber)" % path)
+        d = os.path.dirname(os.path.abspath(path))
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        write_atomic(path, blank_drawio(o["name"]))
+        ver = vault_commit(path, "new blank diagram")
+        print("created blank diagram: %s (page %r)%s" % (
+            path, o["name"], " [%s]" % ver if ver else ""))
+        return
+
     if cmd == "diff":
         import tempfile
 
@@ -757,7 +835,7 @@ def main():
         raw = sys.stdin.read()
         if not raw.strip():
             die("no text on stdin")
-        fill, stroke = COLORS.get(o["color"]) or die("unknown color: %s" % o["color"])
+        fill, stroke = resolve_color(o["color"]) or die("unknown color: %s" % o["color"])
         h = o["h"] or est_height(raw, int(o["w"]))
         cid = o["id"] or auto_id(text)
         style = "rounded=%d;whiteSpace=wrap;html=1;align=left;fillColor=%s;strokeColor=%s;" % (
@@ -774,7 +852,7 @@ def main():
             die("add-edge needs SRC DST")
         src, dst = rest[0], rest[1]
         o = parse_flags(rest[2:], {"label": "", "color": "yellow", "id": None, "arrow": True})
-        _, stroke = COLORS.get(o["color"]) or die("unknown color: %s" % o["color"])
+        _, stroke = resolve_color(o["color"]) or die("unknown color: %s" % o["color"])
         body, _, _ = page_span(text, page or "0")
         for c in (src, dst):
             find_cell(body, c)  # both endpoints must live on the same page
@@ -811,7 +889,7 @@ def main():
         page, rest = pop_page(args)
         if len(rest) < 2:
             die("recolor needs ID COLOR")
-        fill, stroke = COLORS.get(rest[1]) or die("unknown color: %s" % rest[1])
+        fill, stroke = resolve_color(rest[1]) or die("unknown color: %s" % rest[1])
 
         def _recolor(block):
             for attr, val in (("fillColor", fill), ("strokeColor", stroke)):

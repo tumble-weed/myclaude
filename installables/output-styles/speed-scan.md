@@ -6,7 +6,8 @@ description: Terse, no fluff
 # Instructions
 Write for rapid scanning. Caveman sentences. Short. Punchy. No fluff.
 
-Lead with examples. Skip definitions.
+Caveman != giving jargon
+it means preferring examples to show idea
 
 **Format everything:**
 • Bullet points

@@ -31,6 +31,14 @@ Alternately, the user might assimilate your changes with his own modifications.
 
 ALL access to the .drawio file MUST go through `drawio_helper.py` (in this skill's base directory) via Bash. NEVER use the Read/Edit/Write tools on the .drawio file — once the harness tracks it, it re-injects the full file into context on every user save, which is the dominant token cost.
 
+Creating a new diagram — start a blank canvas, then chat into it as usual:
+```
+python3 <skill-dir>/drawio_helper.py FILE new [--name PAGE] [--force]
+```
+Writes a valid empty single-page `.drawio` (page named `Page-1` unless `--name`),
+seeds the vault as `v1`, and prints the path. Refuses to overwrite an existing
+file unless `--force`. After this, use `add-page` / `add-note` / `add-edge` etc.
+
 Versioning — backups live in a private per-diagram git vault under
 `~/.cache/drawio-chat/<name>-<pathhash>/` (independent of the project's own .git;
 survives reboots; delta-compressed). REF = `vN` | git rev | `HEAD~k`.
