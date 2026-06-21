@@ -43,7 +43,11 @@ run again -> nothing changes (already there)
 - Reader thinks: "did I miss something? was this not just said?"
 
 ## 6. Break up big messages
-- Large message → split into parts.
+- Large message → split into parts. Try to organize parts of the message into themes to discover these parts.
 - Show one part.
 - Wait for ack (a decision, or "go on").
 - Then show the next.
+
+## 7. Formatting
+- long sentences across the scrren difficult to read
+- assume showing it on a mobile, or a vim column width of 40
