@@ -51,3 +51,5 @@ run again -> nothing changes (already there)
 ## 7. Formatting
 - long sentences across the scrren difficult to read
 - assume showing it on a mobile, or a vim column width of 40
+- code blocks are exempt from the column rule — let code use whatever width the language needs for proper formatting
+- if a message mixes prose and code, keep the ~40-col constraint on the prose and relax it only for the code
