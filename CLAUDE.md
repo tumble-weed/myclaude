@@ -68,8 +68,9 @@ foreign symlinks and real files are left alone.
 Terse `/`-commands for correcting my output mid-
 chat (all in `installables/commands/`):
 `/stfu` (follow output format), `/tmj` (re-explain
-with example + code), `/tmi` (too much info
-bundled), `/src`
+with example + code), `/split` (multiple themes
+bundled — break apart), `/brief` (one theme but
+too wordy/repetitive — trim), `/src`
 (verify claim against the code), `/slow` (stop,
 confirm before acting), `/wide` (lines wider than
 ~40 cols).
