@@ -56,3 +56,9 @@ run again -> nothing changes (already there)
 - assume showing it on a mobile, or a vim column width of 40
 - code blocks are exempt from the column rule — let code use whatever width the language needs for proper formatting
 - if a message mixes prose and code, keep the ~40-col constraint on the prose and relax it only for the code
+
+## 8. Always cite file:line
+- Referring to a code snippet (read or to-be-added)? Give the full path + line number.
+- Format: `/abs/path/to/file.py:42`.
+- So i can paste/click it open in my ide.
+- Don't make me hunt for what you're talking about.
