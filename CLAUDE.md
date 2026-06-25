@@ -63,6 +63,51 @@ python manage.py <cmd> --claude-dir DIR # target a different config dir
 Only touches symlinks that point back here —
 foreign symlinks and real files are left alone.
 
+## Global CLAUDE.md (the one exception)
+
+`installables/global-claude-md/CLAUDE.md` is the
+tracked **content** of user-level global memory. It
+is the one item NOT symlinked — instead `install`
+writes a real wrapper at `~/.claude/CLAUDE.md` that
+`@`-imports the tracked source. (A wrapper is needed
+because its content is machine-specific.)
+
+Every wrapper carries a sentinel marker
+(`myclaude:global-wrapper`) so the installer always
+recognizes its own file:
+
+- **absent** → write wrapper.
+- **our wrapper** (marker present) → NOOP. `install`
+  and `reinstall` both refuse to back it up.
+- **foreign CLAUDE.md** → `install` prompts, then
+  renames it to `CLAUDE.md.backup.<stamp>` and writes
+  a wrapper importing both the backup and our source.
+  `reinstall` only skips it (never backs up).
+
+Flags: `install --yes` auto-confirms the merge
+(non-interactive); `uninstall` removes only our
+wrapper and leaves any backup for manual restore.
+Edit global memory in `installables/`, never the
+wrapper.
+
+## Global settings.json
+
+`installables/settings-json/settings.json` is
+symlinked to `~/.claude/settings.json` (a whole-file
+symlink — JSON has no import mechanism, so the
+wrapper trick can't apply). It is excluded from
+generic discovery and handled specially:
+
+- **install**: foreign settings.json → backed up to
+  `settings.json.backup.<stamp>`, then symlinked.
+- **reinstall**: foreign → skipped, never backed up.
+- **uninstall**: removes our symlink, then restores
+  the newest backup back to `settings.json`.
+
+The repo source was seeded from the live file, so
+nothing was lost. `outputStyle: "no-bs"` lives here
+(the formal harness toggle), not in global memory.
+
 ## Feedback-command family
 
 Terse `/`-commands for correcting my output mid-
@@ -73,4 +118,5 @@ bundled — break apart), `/brief` (one theme but
 too wordy/repetitive — trim), `/src`
 (verify claim against the code), `/slow` (stop,
 confirm before acting), `/wide` (lines wider than
-~40 cols).
+~40 cols), `/sync` (we're misaligned — I lay out
+the divergence, you check it).
